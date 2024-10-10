@@ -10,8 +10,14 @@
 
 extern "C" {
 
-extern void __VERIFIER_error(void);
-extern void __VERIFIER_assert(bool);
+/*extern void __VERIFIER_error(void);*/
+/*extern void __VERIFIER_assert(bool);*/
+void __VERIFIER_error(void) {}
+void __VERIFIER_assert(int cond) {
+  if (!(cond)) {
+    __VERIFIER_error();
+  }
+}
 
 #define sassert(X)                                                             \
   (void)((__VERIFIER_assert(X), (X)) || (__VERIFIER_error(), 0))
