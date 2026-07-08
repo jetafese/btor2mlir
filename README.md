@@ -2,7 +2,7 @@
 ![os](https://img.shields.io/badge/os-linux-orange?logo=linux)
 ![os](https://img.shields.io/badge/os-macos-silver?logo=apple)
 
-eBPF-BMC is a verification toolchain that applies bounded model checking to eBPF programs via MLIR and LLVM. When verification succeeds, the program is memory-safe under the given bounds. When verification fails, eBPF-BMC produces an **executable counterexample** — a standalone binary that concretely witnesses the violation and can be debugged with standard tools (lldb, gdb).
+eBPF-BMC is a verification toolchain that applies bounded model checking to eBPF programs via MLIR and LLVM. When verification succeeds, the eBPF program is memory-safe. When verification fails, eBPF-BMC produces an **executable counterexample** — a standalone binary that concretely witnesses the violation and can be debugged with standard tools (lldb, gdb).
 
 ## Architecture
 
