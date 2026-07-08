@@ -1,163 +1,138 @@
-# Bᴛᴏʀ2ᴍʟɪʀ: A Format and Toolchain for Hardware Verification
+# eBPF-BMC: Bounded Model Checking for eBPF Programs
 ![os](https://img.shields.io/badge/os-linux-orange?logo=linux)
 ![os](https://img.shields.io/badge/os-macos-silver?logo=apple)
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)][data]
 
-## Results
-Detailed analysis of run-times is available in an accompanying [Jupyter
-Notebook][data] in Google Collab. We also contribute translations of the 2019/20 Hardware Model Checking Competion benchmarks to our Btor Dialect, LLVM-IR and SMT-LIB in [hwmcc20-mlir](https://github.com/jetafese/hwmcc20-mlir). The image below shows the different verification strategies employed. 
+eBPF-BMC is a verification toolchain that applies bounded model checking to eBPF programs via MLIR and LLVM. When verification succeeds, the program is memory-safe under the given bounds. When verification fails, eBPF-BMC produces an **executable counterexample** — a standalone binary that concretely witnesses the violation and can be debugged with standard tools (lldb, gdb).
 
-![strategies-img](./assets/strategies.png "Verification Strategies")
+## Architecture
 
-<!-- ![arch-img](./assets/btor2mlir.png "Architecture") -->
+![architecture](./assets/ebpf-bmc.png "Architecture of eBPF-BMC")
 
-[data]: https://colab.research.google.com/drive/1wau9yTHvsWdBdMjF0TbvHTHEKW6rFHiQ?usp=sharing
+The pipeline:
+1. **eBPF2MLIR** — translates eBPF bytecode (`.o`) into the eBPF Dialect of MLIR
+2. **Analysis & Lowering** — runs type inference, inlining, and memory resolution passes, then converts to LLVM Dialect
+3. **LLVM-IR Generation** — emits LLVM-IR from the LLVM Dialect
+4. **llvm-link** — links the generated IR with helper function summaries (a support library modeling Linux eBPF helpers)
+5. **SeaHorn** — performs bounded model checking; reports SAFE or produces an executable counterexample
 
-## Demo
+## Motivating Example
 
-Consider a simple counter that ensures we do not reach 15, represented in Bᴛᴏʀ2 below:
+Consider a program that performs a path-sensitive packet access — a common pattern in industrial eBPF code (e.g., Cilium):
 
-```btor
-1 sort bitvec 4
-2 zero 1
-3 state 1 out
-4 init 1 3 2
-5 one 1
-6 add 1 3 5
-7 next 1 3 6
-8 ones 1
-9 sort bitvec 1
-10 eq 9 3 8
-11 bad 10
-```
-
-Using the command `build/bin/btor2mlir-translate --import-btor counter.btor2 > counter.mlir`, where `counter.btor2` is the file shown above, we get the equivalent representation of our circuit in the BTOR Dialect of MLIR below (counter.mlir):
-
-```mlir
-module {
-  func @main() {
-    %0 = btor.constant 0 : i4 !btor.bv<4>
-    br ^bb1(%0 : !btor.bv<4>)
-  ^bb1(%1: !btor.bv<4>):  // 2 preds: ^bb0, ^bb1
-    %2 = btor.constant 1 : i4 !btor.bv<4>
-    %3 = btor.add %1, %2 : !btor.bv<4>
-    %4 = btor.constant -1 : i4 !btor.bv<4>
-    %5 = btor.cmp eq, %1, %4 : !btor.bv<4>
-    btor.assert_not(%5), 0 : i64 !btor.bv<1>
-    br ^bb1(%3 : !btor.bv<4>)
-  }
+```c
+SEC("xdp")
+int xdp_prog(xdp_md_t *ctx) {
+    unsigned long key = 0;
+    unsigned long *value = bpf_map_lookup_elem(&map, &key);
+    ETH_HEADER *header = NULL;
+    void* data = (void *)(long)ctx->data;
+    void* data_end = (void *)(long)ctx->data_end;
+    if ((data_end - data) >= sizeof(ETH_HEADER)){
+        header = (void *)(long)ctx->data;
+    }
+    if (!value) { goto Exit; }
+    if (header == NULL){ goto Exit; }
+    return header->Type;
+  Exit:
+    return 0;
 }
 ```
 
-Then, using the command  `build/bin/btor2mlir-opt  --convert-std-to-llvm --convert-btor-to-llvm counter.mlir > counter.mlir.opt` we get the file below which represents the original circuit in the LLVM Dialect of MLIR. 
+Prevail (abstract interpretation) conservatively rejects this program because it cannot track the path-sensitive relationship between the bounds check and the pointer assignment. eBPF-BMC verifies it as safe by evaluating each path independently.
 
-```mlir
-module attributes {llvm.data_layout = ""} {
-  llvm.func @__VERIFIER_error()
-  llvm.func @__VERIFIER_assert(i1, i64)
-  llvm.func @main() {
-    %0 = llvm.mlir.constant(0 : i4) : i4
-    llvm.br ^bb1(%0 : i4)
-  ^bb1(%1: i4):  // 2 preds: ^bb0, ^bb2
-    %2 = llvm.mlir.constant(1 : i4) : i4
-    %3 = llvm.add %1, %2  : i4
-    %4 = llvm.mlir.constant(-1 : i4) : i4
-    %5 = llvm.icmp "eq" %1, %4 : i4
-    %6 = llvm.mlir.constant(true) : i1
-    %7 = llvm.xor %5, %6  : i1
-    llvm.cond_br %7, ^bb2, ^bb3
-  ^bb2:  // pred: ^bb1
-    llvm.br ^bb1(%3 : i4)
-  ^bb3:  // pred: ^bb1
-    %8 = llvm.mlir.constant(0 : i64) : i64
-    llvm.call @__VERIFIER_assert(%7, %8) : (i1, i64) -> ()
-    llvm.call @__VERIFIER_error() : () -> ()
-    llvm.unreachable
-  }
-}
-```
+## Usage
 
-Finally, using the command `build/bin/btor2mlir-translate --mlir-to-llvmir counter.mlir.opt > counter.ll` we generate the circuit as an LLVM-IR program below (counter.ll): 
-
-```llvm
-declare void @__VERIFIER_error()
-declare void @__VERIFIER_assert(i1, i64)
-define void @main() !dbg !3 {
-  br label %1, !dbg !7
-1:                                                ; preds = %6, %0
-  %2 = phi i4 [ %3, %6 ], [ 0, %0 ]
-  %3 = add i4 %2, 1, !dbg !9
-  %4 = icmp eq i4 %2, -1, !dbg !10
-  %5 = xor i1 %4, true, !dbg !11
-  br i1 %5, label %6, label %7, !dbg !12
-6:                                                ; preds = %1
-  br label %1, !dbg !13
-7:                                                ; preds = %1
-  call void @__VERIFIER_assert(i1 %5, i64 0), !dbg !14
-  call void @__VERIFIER_error(), !dbg !15
-  unreachable, !dbg !16
-}
-```
-
-If you have SeaHorn installed locally (a distribution is included in the Docker), we can show that the bad state in the original circuit is reached using SeaHorn's Bounded Model Checking engine. This is indicated by the output **sat** when we run the command: `sea bpf counter.ll`
-
-## Witness Generation
-
-Run the shell script [`./get_cex_seahorn.sh $btor2_file`](utils/cex/witness/get_cex_seahorn.sh) to:
-
-a) extract a counter example from SeaHorn \
-b) generate a Btor2 Witness \
-c) simulate the witness using `btorsim`
-
-## Docker
-
-Dockerfile: [`docker/btor2mlir.Dockerfile`](docker/btor2mlir.Dockerfile).
-
-From the root folder use the following commands to:
-
-Build: `docker build -t btor2mlir . --file docker/btor2mlir.Dockerfile`
-
-Run: `docker run -it btor2mlir`
-
-## Building Locally
-
-The instructions assume that `cmake`, `clang/clang++` and `ninja` are installed on your machine,  `LLVM_PROJECT=/ag/llvm-gh-mlir`, and that `lit`
-command is installed and is globally available
-
-### Building LLVM
-Commands to configure and compile LLVM
+Given an eBPF object file `program.o` with section `xdp` and function `xdp_prog`:
 
 ```sh
-$ mkdir debug && cd debug 
-$ cmake -G Ninja ../llvm \
-    -DCMAKE_C_COMPILER=clang-14 -DCMAKE_CXX_COMPILER=clang++-14 \
-    -DLLVM_ENABLE_PROJECTS=mlir -DLLVM_BUILD_EXAMPLES=ON  \ 
-    -DCMAKE_BUILD_TYPE=Debug \ # change to RelWithDebInfo for release build
-    -DLLVM_TARGETS_TO_BUILD="X86"  \
-    -DLLVM_ENABLE_LLD=ON  \ # only on Linux	
-    -DLLVM_INSTALL_UTILS=ON \ # optional to install FileCheck and lit
-    -DCMAKE_INSTALL_PREFIX=$(pwd)/run  # install location in `run` under build
-$ ninja
-$ ninja install
+# 1. Translate eBPF bytecode to eBPF Dialect
+ebpf2mlir-translate --import-ebpf-mem --section xdp --function xdp_prog program.o > program.mlir
+
+# 2. Run analysis passes (inline, resolve memory, type inference)
+ebpf2mlir-opt --inline --resolve-mem program.mlir > program.res.mlir
+
+# 3. Lower to LLVM Dialect
+ebpf2mlir-opt --convert-ebpf-to-llvm --reconcile-unrealized-casts program.res.mlir > program.opt
+
+# 4. Emit LLVM-IR
+ebpf2mlir-translate --mlir-to-llvmir program.opt > program.ll
+
+# 5. Link with helper summaries
+llvm-link program.ll helper_summaries.ll -S -o program.linked.ll
+
+# 6. Verify with SeaHorn
+sea yama -y sea-cex.yaml fpf program.linked.ll
 ```
 
-The above installs a debug version of llvm under `LLVM_PROJECT/debug/run`, 
-where `LLVM_PROJECT` is the root of llvm project on your machine.
+A convenience script is provided at [`utils/ebpf/script.sh`](utils/ebpf/script.sh).
 
-### Building
-To compile this project
+## Counterexample Debugging
+
+When SeaHorn finds a memory safety violation, the counterexample is materialized as a standalone executable. Developers can inspect it with standard debuggers:
+
+```
+(lldb) target create "bad_correlated.out"
+Current executable set to 'bad_correlated.out' (x86_64).
+(lldb) r
+Process 2545146 stopped
+* thread #1, stop reason = signal SIGSEGV: address not mapped to object (fault address: 0xc)
+  frame #0: bad_correlated.out`main at bad_correlated.o.xdp.mlir.opt:164:12
+   161    %125 = llvm.bitcast %18 : !llvm.ptr<i8> to !llvm.ptr<ptr<i8>>
+   162    %126 = llvm.load %125 : !llvm.ptr<ptr<i8>>
+   163    %127 = llvm.bitcast %126 : !llvm.ptr<i8> to !llvm.ptr<i16>
+-> 164    %128 = llvm.load %127 : !llvm.ptr<i16>
+```
+
+The SIGSEGV directly localizes the failing memory access, providing actionable feedback that developers can trace back to their source program.
+
+## Evaluation
+
+We evaluate eBPF-BMC on **136 eBPF programs** from the [Cilium](https://cilium.io/) project — real-world packet processing and load-balancing logic. We compare against [Prevail](https://github.com/vbpf/ebpf-verifier), a state-of-the-art abstract interpretation verifier for eBPF.
+
+**Key findings:**
+- No verification task exceeded 30 seconds of runtime or 500 KB of peak memory
+- Prevail conservatively rejects 9 programs due to imprecision in path-dependent memory accesses; eBPF-BMC verifies all 9 as safe
+- When safety is violated, eBPF-BMC produces executable counterexamples that can be debugged with lldb/gdb
+
+| | Prevail | eBPF-BMC |
+|---|---|---|
+| Verified safe | 127 | 136 |
+| Rejected (false positive) | 9 | 0 |
+| Executable counterexamples | No | Yes |
+
+**Runtime comparison:**
+
+![runtime](./assets/eval-time.png "Verification time: Prevail vs eBPF-BMC")
+
+**Memory comparison:**
+
+![memory](./assets/eval-memory.png "Peak memory: Prevail vs eBPF-BMC")
+
+Detailed analysis is available in the [results notebook](https://github.com/jetafese/btor2mlir/blob/ebpf/utils/ebpf/results/ebpf_results.ipynb).
+
+## Prerequisites
+
+- [LLVM/MLIR](https://github.com/llvm/llvm-project) (tested with LLVM 14)
+- [SeaHorn](https://github.com/seahorn/seahorn) (provides SeaBMC)
+- [Prevail](https://github.com/vbpf/ebpf-verifier) (for benchmarking; optional for standalone use)
+- CMake, Clang/Clang++, Ninja
+
+## Building
 
 ```sh
-$ mkdir debug && cd debug 
-$ cmake -G Ninja .. \
-    -DMLIR_DIR=/ag/llvm-gh-mlir/debug/run/lib/cmake/mlir \
-    -DLLVM_DIR=/ag/llvm-gh-mlir/debug/run/lib/cmake/llvm \
+mkdir build && cd build
+cmake -G Ninja .. \
+    -DMLIR_DIR=$LLVM_PROJECT/build/lib/cmake/mlir \
+    -DLLVM_DIR=$LLVM_PROJECT/build/lib/cmake/llvm \
     -DLLVM_EXTERNAL_LIT=$(which lit) \
-    -DLLVM_ENABLE_LLD=ON \
-    -DCMAKE_INSTALL_PREFIX=$(pwd)/run \
+    -DCMAKE_C_COMPILER=clang \
+    -DCMAKE_CXX_COMPILER=clang++
+ninja
 ```
 
+This produces the `ebpf2mlir-translate` and `ebpf2mlir-opt` binaries under `build/bin/`.
 
 ## Contributors
-Arie Gurfinkel <arie.gurfinkel@uwaterloo.ca> \
+
+Arie Gurfinkel <arie.gurfinkel@uwaterloo.ca>
 Joseph Tafese <jetafese@uwaterloo.ca>
